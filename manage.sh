@@ -131,14 +131,14 @@ declare -A SERVICE_MAP=(
     
     # 业务应用 (Java)
     ["app"]="app-service|/opt/app|nohup ./startup-linux.sh &|8080|java"
-    ["webapp"]="emc-tool|/opt/app/tools/web|nohup ./startup-linux.sh &|8089|java"
+    ["webapp"]="webapp-tool|/opt/app/tools/web|nohup ./startup-linux.sh &|8089|java"
 )
 
 # 服务组定义 (启动顺序即依赖顺序)
 declare -a GROUP_DEFS=(
     "nnr:nacos,nginx,redis"             # 基础组件组
-    "eap:dmp,emc"                       # 应用组件组
-    "all:nacos,nginx,redis,dmp,emc"     # 全量组
+    "app:app,webapp"                       # 应用组件组
+    "all:nacos,nginx,redis,app,webapp"     # 全量组
 )
 
 # ------------------------------------------------------------------------------
