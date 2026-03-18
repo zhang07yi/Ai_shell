@@ -1,676 +1,850 @@
 #!/bin/bash
-###############################################################################
+#===============================================================================
 # 脚本名称: init_server.sh
-# 版本: 21.0 
-# 
-# 【功能概述】
-# 本脚本用于 Linux 服务器的一键初始化部署。
+# 版本: 1.1.2 (Stable Release + Custom NTP)
+# 描述: 通用 Linux 服务器初始化脚本 (CentOS, Rocky, Alma, Ubuntu, Debian, Kylin, UOS)
+# 许可: MIT License
 #
-# 【使用方法】
-# chmod +x init_server_v21_enhanced.sh && sudo ./init_server_v21_enhanced.sh
-###############################################################################
+# 核心原则:
+# 1. 安全第一: 敏感操作二次确认，配置文件修改前自动备份。
+# 2. 交互灵活: 全程彩色输出，明确提示选项，支持默认值回车跳过。
+# 3. 操作可逆: 所有关键配置均有备份目录 (/root/init_backups_时间戳)。
+# 4. 结果可视: 生成详细报告和日志文件。
+#
+# 更新日志:
+# v1.1.2: [新增] 时间同步模块支持手动输入自定义 NTP 服务器地址 (默认阿里云)。
+# v1.1.1: [修复] 修复 confirm_action 函数中 [y/n] 重复显示的 UI Bug。
+# v1.1.0: [优化] 增加 IP 预展示、缓存更新可选、优化项拆分、报告增强端口展示。
+# v1.0.0: 初始版本发布。
+#===============================================================================
 
-set -uo pipefail
+#-------------------------------------------------------------------------------
+# 全局配置与变量定义
+#-------------------------------------------------------------------------------
+readonly SCRIPT_NAME="init_server.sh"
+readonly LOG_FILE="/var/log/server_init.log"
+readonly BACKUP_DIR="/root/init_backups_$(date +%Y%m%d_%H%M%S)"
+readonly REPORT_FILE="/root/server_init_report_$(date +%Y%m%d_%H%M%S).txt"
 
-# =============================================================================
-# 【🔧 全局配置区域】
-# =============================================================================
+# --- 颜色定义 ---
+COLOR_RESET="\e[0m"
+COLOR_RED="\e[31m"
+COLOR_GREEN="\e[32m"
+COLOR_YELLOW="\e[33m"
+COLOR_BLUE="\e[34m"
+COLOR_CYAN="\e[36m"
+COLOR_BOLD="\e[1m"
 
-# --- 1. 网络与主机身份配置 ---
-DEF_HOSTNAME="linux-node-01"
-DEF_IP_ADDR=""                    # 留空则尝试自动检测
-DEF_PREFIX="24"
-DEF_GATEWAY="192.168.10.2"
-DEF_DNS_1="223.5.5.5"
-DEF_DNS_2="8.8.8.8"
+# --- 运行时状态标记 ---
+declare -a FAILED_PACKAGES=()
+declare -A CONFIG_STATUS=()
+declare -a OPEN_PORTS=()
 
-# --- 2. 安全加固配置 ---
-DEF_ADMIN_USER="ops_admin"
-DEF_SSH_PORT="2222"
+# --- 默认配置变量 ---
+NEW_SSH_PORT=22
+ADMIN_USER=""
+STATIC_IP_MODE="no"
+DATA_DISK_MOUNTED="none"
+CURRENT_IFACE=""
+CURRENT_IP=""
+CURRENT_GW=""
 
-# --- 3. 系统内核优化配置 ---
-DEF_FILE_LIMIT="65535"
-DEF_SWAPPINESS="10"
-DEF_DATA_MOUNT="/data"
+# --- 默认 NTP 服务器 (阿里云) ---
+DEFAULT_NTP_SERVERS="ntp.aliyun.com ntp1.aliyun.com ntp2.aliyun.com"
 
-# --- 4. 基础组件列表 ---
-BASE_COMPONENTS_YUM="vim wget curl net-tools bash-completion telnet unzip tar gzip ntpdate chrony"
-BASE_COMPONENTS_APT="vim wget curl net-tools bash-completion telnet unzip tar gzip ntpdate chrony"
-
-# =============================================================================
-# 【📦 全局变量定义】
-# =============================================================================
-LOG_FILE="/var/log/server_init.log"
-BACKUP_DIR="/root/init_backups_$(date +%F_%H%M)"
-OS_ID=""
-PKG_MGR=""
-LOCAL_REPO_CONFIGURED=false
-
-# 运行时记录变量 (用于最终报告)
-RUN_HOSTNAME=""
-RUN_IP_ADDR=""
-RUN_GATEWAY=""
-RUN_IP_MODE="DHCP/保持原状"  # 新增：记录 IP 模式
-RUN_ADMIN_USER=""
-RUN_SSH_PORT=""
-RUN_DISABLE_ROOT="No"
-RUN_DISABLE_PASS="No"
-RUN_DATA_MOUNT_INFO="未操作"
-RUN_COMPONENTS_INSTALLED="否" # 新增：记录组件安装状态
-
-# 颜色定义
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
-
-# =============================================================================
-# 【🛠️ 基础工具函数库】
-# =============================================================================
+#-------------------------------------------------------------------------------
+# 工具函数库
+#-------------------------------------------------------------------------------
 
 log() {
-    local level=$1; shift
-    local msg="$*"
-    local ts=$(date '+%Y-%m-%d %H:%M:%S')
-    printf "%s [%s] %s\n" "$ts" "$level" "$msg" >> "$LOG_FILE"
+    local level="$1"
+    local msg="$2"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $msg" >> "$LOG_FILE"
     
-    local color_code=""
+    local color=$COLOR_RESET
     local icon=""
-    case $level in
-        "INFO")    color_code="$BLUE"; icon="ℹ️" ;;
-        "SUCCESS") color_code="$GREEN"; icon="✅" ;;
-        "WARN")    color_code="$YELLOW"; icon="⚠️" ;;
-        "ERROR")   color_code="$RED"; icon="❌" ;;
-        "PROMPT")  color_code="$CYAN"; icon="👉" ;;
-        "STEP")    color_code="$BOLD$CYAN"; icon="🚀" ;;
-        "SUMMARY") color_code="$BOLD$GREEN"; icon="📋" ;;
+    case "$level" in
+        INFO)    color=$COLOR_BLUE;  icon="ℹ️" ;;
+        SUCCESS) color=$COLOR_GREEN; icon="✅" ;;
+        WARN)    color=$COLOR_YELLOW; icon="⚠️" ;;
+        ERROR)   color=$COLOR_RED;   icon="❌" ;;
     esac
-    
-    if [[ -n "$color_code" ]]; then
-        printf "${color_code}[%s] ${icon} %s${NC}\n" "$level" "$msg"
-    else
-        printf "%s\n" "$msg"
+    echo -e "${color}${COLOR_BOLD}[$icon] [$level]${COLOR_RESET} $msg"
+}
+
+backup_file() {
+    local file="$1"
+    if [[ -f "$file" ]]; then
+        mkdir -p "$BACKUP_DIR"
+        local basename=$(basename "$file")
+        cp "$file" "$BACKUP_DIR/${basename}.bak"
+        log INFO "已备份文件: $file"
+    elif [[ -d "$file" ]] && [[ "$file" == *.repo ]]; then
+         mkdir -p "$BACKUP_DIR"
+         cp -r "$file" "$BACKUP_DIR/" 2>/dev/null
+         log INFO "已备份目录/文件组: $file"
     fi
 }
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        log "ERROR" "必须使用 root 用户运行！"
+        log ERROR "非 Root 用户运行！请使用 'sudo $0' 或切换到 root 用户。"
         exit 1
     fi
 }
 
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS_ID=$ID
-        if [[ "$OS_ID" == "kylin" || "$OS_ID" == "neokylin" || "$OS_ID" == "uos" || "$OS_ID" == "deepin" ]]; then
-            log "INFO" "检测到国产化系统：$PRETTY_NAME"
-        else
-            log "INFO" "检测到系统：$PRETTY_NAME"
-        fi
-    else
-        log "ERROR" "无法识别操作系统。"
-        exit 1
-    fi
-
-    if command -v apt &>/dev/null; then PKG_MGR="apt";
-    elif command -v yum &>/dev/null; then PKG_MGR="yum";
-    elif command -v dnf &>/dev/null; then PKG_MGR="dnf";
-    else log "ERROR" "未找到包管理器。"; exit 1; fi
-    log "INFO" "包管理器：$PKG_MGR"
-}
-
-get_input() {
-    local prompt_msg="$1"
-    local default_val="$2"
+# 优化的二次确认函数 (避免重复提示)
+confirm_action() {
+    local prompt="$1"
+    local default="${2:-y}"
     local response
-    if [[ -n "$default_val" ]]; then
-        printf "${CYAN}👉 ${prompt_msg} [默认：${BOLD}${default_val}${NC}${CYAN}]: ${NC}"
-        read -r response
-        INPUT_RESULT="${response:-$default_val}"
-    else
-        printf "${CYAN}👉 ${prompt_msg}: ${NC}"
-        read -r response
-        INPUT_RESULT="$response"
-    fi
-}
-
-ask_confirm() {
-    local msg="$1"
+    
     while true; do
-        printf "${YELLOW}❓ ${msg} (y/n): ${NC}"
-        read -r yn
-        case $yn in
+        echo -ne "${COLOR_BOLD}$prompt [y/n]: ${COLOR_RESET}"
+        read response
+        if [[ -z "$response" ]]; then
+            response=$default
+        fi
+        case "$response" in
             [Yy]*) return 0 ;;
             [Nn]*) return 1 ;;
-            *) echo "请输入 y 或 n。";;
+            *) echo -e "${COLOR_YELLOW}无效输入，请输入 y (是) 或 n (否)。${COLOR_RESET}";;
         esac
     done
 }
 
-create_backup() {
-    local target="$1"
-    if [[ ! -e "$target" ]]; then return 0; fi
-    mkdir -p "$BACKUP_DIR"
-    local backup_name="$(basename "$target").bak.$(date +%s)"
-    if [[ -f "$target" ]]; then
-        \cp -f "$target" "$BACKUP_DIR/$backup_name"
-        log "INFO" "已备份：$target"
-    elif [[ -d "$target" ]]; then
-        tar -czf "$BACKUP_DIR/$(basename "$target").tar.gz" -C "$(dirname "$target")" "$(basename "$target")" 2>/dev/null
-        log "INFO" "已备份目录：$target"
+get_input() {
+    local prompt="$1"
+    local default="$2"
+    local input
+    if [[ -n "$default" ]]; then
+        read -rp "$prompt [默认: $default]: " input
+        echo "${input:-$default}"
+    else
+        read -rp "$prompt: " input
+        echo "$input"
     fi
 }
 
-get_current_ip() {
-    local ip=""
-    local iface=$(ip route | grep default | awk '{print $5}' | head -n1)
-    if [[ -n "$iface" ]]; then
-        ip=$(ip -4 addr show "$iface" | grep "inet " | awk '{print $2}' | cut -d/ -f1 | head -n1)
-    fi
-    if [[ -z "$ip" ]]; then
-        ip=$(ip -4 addr show | grep "inet " | grep -v 127.0.0.1 | head -n1 | awk '{print $2}' | cut -d/ -f1)
-    fi
-    echo "${ip:-}"
-}
+#-------------------------------------------------------------------------------
+# 2.1 环境检测与预处理
+#-------------------------------------------------------------------------------
 
-# =============================================================================
-# 【🚀 核心业务模块】
-# =============================================================================
-
-# ------------------------------------------------------------------------------
-# 模块 1: 主机身份与网络配置 (v21: 增加静态 IP 开关)
-# ------------------------------------------------------------------------------
-config_network_identity() {
-    log "STEP" "[1/8] 开始配置主机名与网络..."
+detect_os() {
+    log INFO "正在检测操作系统..."
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        OS_ID=$ID
+        OS_VERSION=$VERSION_ID
+        OS_NAME=$PRETTY_NAME
+    elif [[ -f /etc/centos-release ]]; then
+        OS_ID="centos"
+        OS_VERSION=$(cat /etc/centos-release | grep -oP '\d+' | head -1)
+        OS_NAME=$(cat /etc/centos-release)
+    else
+        log ERROR "无法识别操作系统类型。"
+        exit 1
+    fi
     
-    if ! ask_confirm "是否需要配置主机名？"; then
-        RUN_HOSTNAME=$(hostname)
-    else
-        local current_hostname=$(hostname)
-        get_input "设置新的主机名" "$DEF_HOSTNAME"
-        local target_hostname="$INPUT_RESULT"
-        RUN_HOSTNAME="$target_hostname"
-        
-        if [[ "$current_hostname" != "$target_hostname" ]]; then
-            hostnamectl set-hostname "$target_hostname"
-            log "SUCCESS" "主机名已更新：$target_hostname"
-        fi
+    if [[ "$OS_ID" == "kylin" || "$OS_ID" == "uos" || ("$OS_ID" == "ubuntu" && "$OS_NAME" == *"UnionTech"*) ]]; then
+        log INFO "🇨🇳 检测到国产化系统: $OS_NAME"
     fi
 
-    # ★★★ 新增：独立询问是否设置静态 IP ★★★
-    if ask_confirm "是否设置静态 IP 地址？(选 n 则保持 DHCP 或当前状态)"; then
-        RUN_IP_MODE="静态 IP"
-        local current_ip=$(get_current_ip)
-        if [[ -n "$current_ip" ]]; then
-            log "INFO" "🌐 当前检测到的 IP: ${BOLD}$current_ip${NC}"
-            get_input "设置新的静态 IP" "$DEF_IP_ADDR"
-            if [[ -z "$INPUT_RESULT" && -z "$DEF_IP_ADDR" ]]; then
-                 INPUT_RESULT="$current_ip"
-            fi
+    log SUCCESS "操作系统: $OS_NAME (ID: $OS_ID, Version: $OS_VERSION)"
+    
+    if command -v dnf &> /dev/null; then
+        PKG_MGR="dnf"
+    elif command -v yum &> /dev/null; then
+        PKG_MGR="yum"
+    elif command -v apt &> /dev/null; then
+        PKG_MGR="apt"
+        export DEBIAN_FRONTEND=noninteractive
+    else
+        log ERROR "未找到支持的包管理器 (yum/dnf/apt)。"
+        exit 1
+    fi
+    log INFO "包管理器: $PKG_MGR"
+}
+
+init_logging() {
+    mkdir -p "$(dirname $LOG_FILE)"
+    touch "$LOG_FILE"
+    echo "========================================" >> "$LOG_FILE"
+    echo "Init Start: $(date)" >> "$LOG_FILE"
+    echo "OS: $OS_NAME" >> "$LOG_FILE"
+    echo "========================================" >> "$LOG_FILE"
+}
+
+#-------------------------------------------------------------------------------
+# 2.2 网络与主机身份配置
+#-------------------------------------------------------------------------------
+
+config_hostname() {
+    log INFO "--- 🖥️ 主机名配置 ---"
+    local current_hostname=$(hostname)
+    log INFO "当前主机名: $current_hostname"
+    
+    local new_hostname=$(get_input "请输入新主机名" "$current_hostname")
+    
+    if [[ "$new_hostname" != "$current_hostname" ]]; then
+        backup_file /etc/hostname
+        backup_file /etc/hosts
+        
+        hostnamectl set-hostname "$new_hostname"
+        
+        if grep -q "127.0.0.1.*localhost" /etc/hosts; then
+            sed -i "s/127.0.0.1.*localhost.*/127.0.0.1   localhost $new_hostname/" /etc/hosts
         else
-            log "WARN" "未检测到 IP，请手动输入。"
-            get_input "设置新的静态 IP" "$DEF_IP_ADDR"
+            echo "127.0.0.1   localhost $new_hostname" >> /etc/hosts
         fi
         
-        local target_ip="$INPUT_RESULT"
-        RUN_IP_ADDR="$target_ip"
-        local network_config_success=false 
-
-        if [[ -n "$target_ip" ]]; then
-            get_input "设置默认网关" "$DEF_GATEWAY"
-            local target_gw="$INPUT_RESULT"
-            RUN_GATEWAY="$target_gw"
-            
-            get_input "设置子网前缀 (PREFIX)" "$DEF_PREFIX"
-            local target_prefix="$INPUT_RESULT"
-            
-            if ask_confirm "确认应用网络配置？"; then
-                local iface=$(ip route | grep default | awk '{print $5}' | head -1)
-                if [[ -z "$iface" ]]; then
-                    iface=$(ip link show | awk -F: '$0 !~ "lo|vir|docker|^$" && /UP/ {print $2}' | tr -d ' ' | head -n1)
-                fi
-
-                if [[ -z "$iface" ]]; then
-                    log "ERROR" "无法识别网卡。"
-                else
-                    local cfg_file=""
-                    if [[ -d /etc/sysconfig/network-scripts ]]; then
-                        cfg_file="/etc/sysconfig/network-scripts/ifcfg-$iface"
-                    elif [[ -f /etc/netplan/*.yaml ]]; then
-                        log "WARN" "Netplan 需手动配置，跳过自动改写。"
-                    fi
-
-                    if [[ -n "$cfg_file" && -f "$cfg_file" ]]; then
-                        create_backup "$cfg_file"
-                        local old_uuid=$(grep "^UUID=" "$cfg_file" 2>/dev/null | cut -d'=' -f2 | tr -d ' ')
-                        [[ -z "$old_uuid" ]] && old_uuid=$(cat /proc/sys/kernel/random/uuid)
-
-                        cat > "$cfg_file" << EOF
-TYPE=Ethernet
-BOOTPROTO=static
-DEFROUTE=yes
-NAME=$iface
-DEVICE=$iface
-ONBOOT=yes
-IPADDR=$target_ip
-PREFIX=$target_prefix
-GATEWAY=$target_gw
-DNS1=$DEF_DNS_1
-DNS2=$DEF_DNS_2
-EOF
-                        systemctl restart network 2>/dev/null || true
-                        systemctl restart NetworkManager 2>/dev/null || true
-                        sleep 5
-                        
-                        if [[ "$(get_current_ip)" == "$target_ip" ]]; then
-                            network_config_success=true
-                            log "SUCCESS" "网络配置验证通过。"
-                        else
-                            log "ERROR" "网络配置验证失败。"
-                        fi
-                    fi
-                fi
-            fi
-        fi
-        
-        if [[ "$network_config_success" == true ]]; then
-            local final_ip=$(get_current_ip)
-            [[ -z "$final_ip" ]] && final_ip="$target_ip"
-            local hosts_file="/etc/hosts"
-            create_backup "$hosts_file"
-            sed -i "/[[:space:]]${RUN_HOSTNAME}$/d" "$hosts_file"
-            echo "$final_ip $RUN_HOSTNAME" >> "$hosts_file"
-            log "SUCCESS" "Hosts 已更新。"
-        fi
+        log SUCCESS "主机名已修改为: $new_hostname"
+        CONFIG_STATUS[HOSTNAME]="$new_hostname"
     else
-        # 用户选择不设置静态 IP
-        RUN_IP_MODE="DHCP/保持原状"
-        RUN_IP_ADDR=$(get_current_ip)
-        RUN_GATEWAY=$(ip route | grep default | awk '{print $3}' | head -1)
-        log "INFO" "已跳过静态 IP 配置，保持当前网络状态。"
-        sync_hosts_file
+        CONFIG_STATUS[HOSTNAME]="$current_hostname (未变)"
     fi
 }
 
-sync_hosts_file() {
-    local target_hostname=${1:-$(hostname)}
-    local current_ip=$(get_current_ip)
-    local hosts_file="/etc/hosts"
-    if [[ -z "$current_ip" || ! -w "$hosts_file" ]]; then return 1; fi
-    create_backup "$hosts_file"
-    sed -i "/[[:space:]]${target_hostname}$/d" "$hosts_file"
-    echo "$current_ip $target_hostname" >> "$hosts_file"
+config_network() {
+    log INFO "--- 🌐 网络配置 ---"
+    
+    CURRENT_IFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
+    if [[ -z "$CURRENT_IFACE" ]]; then
+        CURRENT_IFACE=$(ip link show | awk -F: '$0 !~ "lo|vir|docker|br" {print $2; exit}' | tr -d ' ')
+    fi
+    
+    if [[ -n "$CURRENT_IFACE" ]]; then
+        CURRENT_IP=$(ip -4 addr show $CURRENT_IFACE 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -n1)
+        CURRENT_GW=$(ip route | grep default | awk '{print $3}' | head -n1)
+        CURRENT_PREFIX=$(ip -4 addr show $CURRENT_IFACE 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f2 | head -n1)
+        
+        log INFO "📡 当前网络状态:"
+        log INFO "   网卡接口：$CURRENT_IFACE"
+        log INFO "   当前 IP  : ${CURRENT_IP:-未获取到}"
+        log INFO "   子网前缀 : ${CURRENT_PREFIX:-未知}"
+        log INFO "   默认网关 : ${CURRENT_GW:-未获取到}"
+    else
+        log WARN "未检测到有效的主网卡接口。"
+    fi
+
+    if confirm_action "是否设置静态 IP? (选 n 保持 DHCP/现状)"; then
+        STATIC_IP_MODE="yes"
+        
+        local static_ip=$(get_input "请输入静态 IP 地址" "$CURRENT_IP")
+        local prefix_len=$(get_input "请输入子网前缀长度 (如 24)" "${CURRENT_PREFIX:-24}")
+        local gateway=$(get_input "请输入网关地址" "$CURRENT_GW")
+        local dns1=$(get_input "请输入主 DNS" "8.8.8.8")
+        local dns2=$(get_input "请输入备 DNS" "1.1.1.1")
+
+        if [[ -z "$static_ip" || -z "$gateway" ]]; then
+            log ERROR "IP 或网关不能为空，配置失败。"
+            CONFIG_STATUS[IP_MODE]="配置失败"
+            return
+        fi
+
+        backup_file "/etc/sysconfig/network-scripts/ifcfg-$CURRENT_IFACE" 2>/dev/null
+        backup_file "/etc/netplan/00-installer-config.yaml" 2>/dev/null
+        backup_file "/etc/network/interfaces" 2>/dev/null
+
+        log INFO "正在应用静态 IP: $static_ip/$prefix_len, GW: $gateway"
+
+        if [[ "$OS_ID" =~ ^(centos|rocky|almalinux|kylin|uos)$ ]] || [[ -f /etc/redhat-release ]]; then
+            local ifcfg_file="/etc/sysconfig/network-scripts/ifcfg-$CURRENT_IFACE"
+            if [[ ! -f "$ifcfg_file" ]]; then
+                cat > "$ifcfg_file" <<EOF
+TYPE=Ethernet
+BOOTPROTO=none
+DEFROUTE=yes
+NAME=$CURRENT_IFACE
+DEVICE=$CURRENT_IFACE
+ONBOOT=yes
+EOF
+            fi
+
+            sed -i "s/^BOOTPROTO=.*/BOOTPROTO=none/" "$ifcfg_file"
+            sed -i "s/^ONBOOT=.*/ONBOOT=yes/" "$ifcfg_file"
+            sed -i '/^IPADDR/d' "$ifcfg_file"
+            sed -i '/^PREFIX/d' "$ifcfg_file"
+            sed -i '/^GATEWAY/d' "$ifcfg_file"
+            sed -i '/^DNS/d' "$ifcfg_file"
+            
+            cat >> "$ifcfg_file" <<EOF
+IPADDR=$static_ip
+PREFIX=$prefix_len
+GATEWAY=$gateway
+DNS1=$dns1
+DNS2=$dns2
+EOF
+            systemctl restart NetworkManager 2>/dev/null || service network restart 2>/dev/null || true
+            
+        elif [[ "$OS_ID" =~ ^(ubuntu|debian)$ ]]; then
+            if command -v netplan &> /dev/null && ls /etc/netplan/*.yaml &>/dev/null; then
+                local netplan_file=$(ls /etc/netplan/*.yaml | head -n1)
+                cat > "$netplan_file" <<EOF
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    $CURRENT_IFACE:
+      dhcp4: no
+      addresses: [$static_ip/$prefix_len]
+      routes:
+        - to: default
+          via: $gateway
+      nameservers:
+        addresses: [$dns1, $dns2]
+EOF
+                netplan apply
+            else
+                log WARN "未检测到 Netplan，跳过自动配置。"
+            fi
+        fi
+
+        sleep 3
+        if ping -c 1 -W 2 $gateway &> /dev/null; then
+            log SUCCESS "网络配置成功！新 IP 已生效。"
+            CONFIG_STATUS[IP_MODE]="静态 ($static_ip)"
+            CONFIG_STATUS[GATEWAY]="$gateway"
+        else
+            log ERROR "⚠️ 网络配置后无法 Ping 通网关！请检查物理连接或配置。"
+            CONFIG_STATUS[IP_MODE]="静态 (可能失败)"
+        fi
+    else
+        log INFO "跳过静态 IP 配置，保持现状。"
+        STATIC_IP_MODE="no"
+        CONFIG_STATUS[IP_MODE]="DHCP/动态"
+    fi
 }
 
-# ------------------------------------------------------------------------------
-# 模块 2: 软件源管理
-# ------------------------------------------------------------------------------
-config_local_repo() {
-    log "STEP" "[2/8] 开始配置软件源..."
-    if ! ask_confirm "是否配置本地/内网软件源？"; then
-        if ask_confirm "是否重写在线源地址？"; then
-            if [[ "$PKG_MGR" == "yum" || "$PKG_MGR" == "dnf" ]]; then
-                local repo_dir="/etc/yum.repos.d"
-                create_backup "$repo_dir"
-                mkdir -p "$BACKUP_DIR/old_repos"
-                \mv "$repo_dir"/*.repo "$BACKUP_DIR/old_repos/" 2>/dev/null || true
-                get_input "请输入新的在线源 BaseURL" ""
-                local new_url="$INPUT_RESULT"
-                if [[ -n "$new_url" ]]; then
-                    cat > "$repo_dir/custom_online.repo" << EOF
-[Custom-Online]
-name=Custom Online Repository
-baseurl=$new_url
+#-------------------------------------------------------------------------------
+# 2.3 软件源管理
+#-------------------------------------------------------------------------------
+
+config_repos() {
+    log INFO "--- 📦 软件源配置 ---"
+    
+    if confirm_action "是否配置本地/内网源？"; then
+        log INFO "进入内网源配置模式..."
+        local mode
+        PS3="请选择源类型 [1-3]: "
+        select mode in "ISO 镜像挂载" "HTTP 内网源" "取消"; do
+            case $mode in
+                "ISO 镜像挂载")
+                    local iso_path=$(get_input "请输入 ISO 镜像路径 (如 /dev/sr0)" "/dev/sr0")
+                    local mount_point=$(get_input "请输入挂载点" "/mnt/cdrom")
+                    mkdir -p "$mount_point"
+                    if mount "$iso_path" "$mount_point" 2>/dev/null || mount -o loop "$iso_path" "$mount_point" 2>/dev/null; then
+                        if ! grep -q "$mount_point" /etc/fstab; then
+                            echo "$iso_path $mount_point iso9660 defaults 0 0" >> /etc/fstab
+                        fi
+                        if [[ "$PKG_MGR" =~ yum|dnf ]]; then
+                            cat > /etc/yum.repos.d/local.repo <<EOF
+[Local-Repo]
+name=Local ISO Repo
+baseurl=file://$mount_point
 enabled=1
 gpgcheck=0
 EOF
-                    $PKG_MGR makecache && LOCAL_REPO_CONFIGURED=true || LOCAL_REPO_CONFIGURED=false
-                fi
-            elif [[ "$PKG_MGR" == "apt" ]]; then
-                local sources_list="/etc/apt/sources.list"
-                create_backup "$sources_list"
-                > "$sources_list"
-                \rm -f /etc/apt/sources.list.d/*.list 2>/dev/null || true
-                get_input "请输入新的在线源地址" ""
-                local new_url="$INPUT_RESULT"
-                if [[ -n "$new_url" ]]; then
-                    local codename=$(lsb_release -cs 2>/dev/null || echo "unknown")
-                    cat > "$sources_list" << EOF
-deb $new_url $codename main restricted universe multiverse
-deb $new_url $codename-updates main restricted universe multiverse
-deb $new_url $codename-security main restricted universe multiverse
-EOF
-                    apt update && LOCAL_REPO_CONFIGURED=true || LOCAL_REPO_CONFIGURED=false
+                            log SUCCESS "ISO 源已挂载并配置。"
+                        fi
+                    else
+                        log ERROR "挂载失败。"
+                    fi
+                    break
+                    ;;
+                "HTTP 内网源")
+                    local http_url=$(get_input "请输入内网 HTTP 源地址" "")
+                    if [[ -n "$http_url" ]]; then
+                        if [[ "$PKG_MGR" =~ yum|dnf ]]; then
+                             for repo in /etc/yum.repos.d/*.repo; do
+                                [[ -f "$repo" ]] || continue
+                                sed -i "s|^baseurl=.*|baseurl=$http_url|g" "$repo"
+                            done
+                        elif [[ "$PKG_MGR" == "apt" ]]; then
+                            echo "deb $http_url \$(lsb_release -cs) main" > /etc/apt/sources.list
+                        fi
+                        log SUCCESS "HTTP 内网源已配置。"
+                    fi
+                    break
+                    ;;
+                "取消") break ;;
+                *) log WARN "无效选项，请输入数字 1-3";;
+            esac
+        done
+    else
+        if confirm_action "是否重写在线源地址 (如阿里云/清华源)?"; then
+            log INFO "请输入新的在线源 BaseURL (无默认值，需手填):"
+            local custom_url=$(get_input "BaseURL" "")
+            if [[ -n "$custom_url" ]]; then
+                backup_file /etc/yum.repos.d/*.repo 2>/dev/null
+                backup_file /etc/apt/sources.list 2>/dev/null
+                
+                if [[ "$PKG_MGR" =~ yum|dnf ]]; then
+                    for repo in /etc/yum.repos.d/*.repo; do
+                        [[ -f "$repo" ]] || continue
+                        sed -i "s|^baseurl=.*|baseurl=$custom_url|g" "$repo"
+                        sed -i "s|^mirrorlist=.*|#mirrorlist=disabled|g" "$repo"
+                        sed -i "s|^metalink=.*|#metalink=disabled|g" "$repo"
+                    done
+                    log SUCCESS "YUM/DNF 源已更新。"
+                elif [[ "$PKG_MGR" == "apt" ]]; then
+                    echo "deb $custom_url \$(lsb_release -cs) main" > /etc/apt/sources.list
+                    log SUCCESS "APT 源已更新。"
                 fi
             fi
         else
-            LOCAL_REPO_CONFIGURED=false
-        fi
-        return
-    fi
-
-    # 简化版本地源逻辑 (ISO/HTTP)
-    echo -e "${CYAN}请选择源类型:${NC} 1) ISO 镜像挂载  2) 内网 HTTP 源  0) 取消"
-    read -rp "选项： " repo_choice
-    [[ "$repo_choice" == "0" ]] && { LOCAL_REPO_CONFIGURED=false; return; }
-
-    local success=false
-    local mount_point="/mnt/cdrom"
-    mkdir -p "$mount_point"
-
-    if [[ "$PKG_MGR" == "yum" || "$PKG_MGR" == "dnf" ]]; then
-        create_backup "/etc/yum.repos.d"
-        \mv /etc/yum.repos.d/*.repo "$BACKUP_DIR/old_repos/" 2>/dev/null || true
-    elif [[ "$PKG_MGR" == "apt" ]]; then
-        create_backup "/etc/apt/sources.list"
-        > /etc/apt/sources.list
-    fi
-
-    if [[ "$repo_choice" == "1" ]]; then
-        get_input "ISO 路径" ""
-        local iso_path="$INPUT_RESULT"
-        if [[ -f "$iso_path" ]] && mount -o loop "$iso_path" "$mount_point" 2>/dev/null; then
-            echo "$iso_path  $mount_point  iso9660  loop 0 0" >> /etc/fstab
-            if [[ "$PKG_MGR" == "yum" || "$PKG_MGR" == "dnf" ]]; then
-                echo -e "[Local-ISO]\nbaseurl=file://$mount_point\nenabled=1\ngpgcheck=0" > "/etc/yum.repos.d/local_iso.repo"
-                $PKG_MGR makecache && success=true
-            elif [[ "$PKG_MGR" == "apt" ]]; then
-                echo "deb [trusted=yes] file:$mount_point ./" > /etc/apt/sources.list
-                apt update && success=true
-            fi
-        fi
-    elif [[ "$repo_choice" == "2" ]]; then
-        get_input "内网源 URL" ""
-        local repo_url="$INPUT_RESULT"
-        if [[ -n "$repo_url" ]]; then
-            if [[ "$PKG_MGR" == "yum" || "$PKG_MGR" == "dnf" ]]; then
-                echo -e "[Local-Net]\nbaseurl=$repo_url\nenabled=1\ngpgcheck=0" > "/etc/yum.repos.d/local_net.repo"
-                $PKG_MGR makecache && success=true
-            elif [[ "$PKG_MGR" == "apt" ]]; then
-                local codename=$(lsb_release -cs 2>/dev/null || echo "unknown")
-                echo -e "deb $repo_url $codename main restricted universe multiverse\ndeb $repo_url $codename-security main restricted universe multiverse" > /etc/apt/sources.list
-                apt update && success=true
-            fi
+            log INFO "保持原有在线源配置。"
         fi
     fi
-    [[ "$success" == true ]] && LOCAL_REPO_CONFIGURED=true || LOCAL_REPO_CONFIGURED=false
-}
 
-# ------------------------------------------------------------------------------
-# 模块 3: 安装组件 (v21: 增加独立开关)
-# ------------------------------------------------------------------------------
-check_and_install_components() {
-    log "STEP" "[3/8] 基础组件安装..."
-    
-    # ★★★ 新增：独立询问是否安装组件 ★★★
-    if ! ask_confirm "是否安装基础组件 (vim, wget, curl 等)？"; then
-        log "INFO" "用户选择跳过组件安装。"
-        RUN_COMPONENTS_INSTALLED="否 (用户跳过)"
-        return
-    fi
-
-    local components=""
-    [[ "$PKG_MGR" == "apt" ]] && components="$BASE_COMPONENTS_APT" || components="$BASE_COMPONENTS_YUM"
-
-    if [[ "$LOCAL_REPO_CONFIGURED" == true ]]; then
-        install_components_logic "$components"
-        RUN_COMPONENTS_INSTALLED="是 (本地源)"
-    else
-        if ping -c 3 -W 2 www.baidu.com > /dev/null 2>&1; then
-            install_components_logic "$components"
-            RUN_COMPONENTS_INSTALLED="是 (在线源)"
+    if confirm_action "是否立即更新软件包缓存 (makecache/apt update)?"; then
+        log INFO "正在更新软件包缓存..."
+        if [[ "$PKG_MGR" == "apt" ]]; then
+            apt update
         else
-            log "WARN" "网络不通且无本地源，跳过安装。"
-            RUN_COMPONENTS_INSTALLED="否 (网络不通)"
+            $PKG_MGR makecache -y
         fi
+        log SUCCESS "缓存更新完成。"
+    else
+        log INFO "跳过缓存更新，您可稍后手动执行。"
     fi
 }
 
-install_components_logic() {
-    local comps="$1"
-    local failed_pkgs=()
-    log "INFO" "正在安装：$comps"
+#-------------------------------------------------------------------------------
+# 2.4 基础组件安装
+#-------------------------------------------------------------------------------
+
+install_packages() {
+    log INFO "--- 🛠️ 基础组件安装 ---"
     
-    if [[ "$PKG_MGR" == "apt" ]]; then
-        apt update -y
-        for pkg in $comps; do
-            apt install -y "$pkg" > /dev/null 2>&1 || failed_pkgs+=("$pkg")
-        done
-    else
-        $PKG_MGR makecache -y 2>/dev/null || true
-        for pkg in $comps; do
-            $PKG_MGR install -y "$pkg" > /dev/null 2>&1 || failed_pkgs+=("$pkg")
-        done
-    fi
-
-    if [[ ${#failed_pkgs[@]} -gt 0 ]]; then
-        log "ERROR" "❌ 以下组件安装失败："
-        for pkg in "${failed_pkgs[@]}"; do echo "   - $pkg"; done
-    else
-        log "SUCCESS" "✅ 组件安装完成。"
-    fi
-}
-
-# ------------------------------------------------------------------------------
-# 模块 4: 安全加固
-# ------------------------------------------------------------------------------
-harden_security() {
-    log "STEP" "[4/8] 安全加固 (SSH)..."
-    if ! ask_confirm "是否进行 SSH 安全加固？"; then 
-        RUN_SSH_PORT=$(grep "^Port" /etc/ssh/sshd_config 2>/dev/null | tail -1 | awk '{print $2}')
-        RUN_SSH_PORT=${RUN_SSH_PORT:-22}
-        RUN_ADMIN_USER="未新建"
+    if ! confirm_action "是否安装基础组件 (vim, wget, curl 等)?"; then
+        log INFO "跳过基础组件安装。"
+        CONFIG_STATUS[PACKAGES]="未安装"
         return
     fi
-    
-    get_input "设置管理员用户名" "$DEF_ADMIN_USER"
-    local user="$INPUT_RESULT"
-    RUN_ADMIN_USER="$user"
-    
-    if ! id "$user" &>/dev/null; then
-        useradd -m -s /bin/bash "$user"
-        echo "$user ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/$user
-        chmod 440 /etc/sudoers.d/$user
-        log "SUCCESS" "用户 $user 创建成功。"
-        passwd "$user"
-    fi
-    
-    local ssh_conf="/etc/ssh/sshd_config"
-    create_backup "$ssh_conf"
-    
-    get_input "设置 SSH 端口" "$DEF_SSH_PORT"
-    RUN_SSH_PORT="$INPUT_RESULT"
-    
-    sed -i "s/^Port .*/#&/" "$ssh_conf"
-    echo "Port $RUN_SSH_PORT" >> "$ssh_conf"
-    
-    if ask_confirm "禁止 Root 远程登录？"; then
-        sed -i "s/^#*PermitRootLogin.*/PermitRootLogin no/" "$ssh_conf"
-        RUN_DISABLE_ROOT="Yes"
+
+    if ! ping -c 1 -W 2 8.8.8.8 &> /dev/null; then
+        log WARN "外网不通 (Ping 8.8.8.8 失败)。若无本地源，安装可能会失败。"
+        if ! confirm_action "是否继续尝试安装？"; then
+            CONFIG_STATUS[PACKAGES]="跳过 (网络不通)"
+            return
+        fi
     fi
 
-    if ask_confirm "禁止密码认证？"; then
-        sed -i "s/^#*PasswordAuthentication.*/PasswordAuthentication no/" "$ssh_conf"
-        RUN_DISABLE_PASS="Yes"
+    local packages=(vim wget curl net-tools bash-completion telnet unzip tar gzip chrony)
+    if [[ "$PKG_MGR" =~ yum|dnf ]]; then
+        packages+=(policycoreutils-python-utils) 
+    else
+        packages+=(openssh-server) 
     fi
-}
 
-# ------------------------------------------------------------------------------
-# 模块 5: 防火墙
-# ------------------------------------------------------------------------------
-config_firewall() {
-    log "STEP" "[5/8] 配置防火墙..."
-    if ! ask_confirm "是否配置防火墙？"; then return; fi
+    log INFO "正在安装: ${packages[*]}"
     
-    [[ -z "${RUN_SSH_PORT:-}" ]] && RUN_SSH_PORT=22
-    
-    echo -e "${CYAN}选择防火墙：1) firewalld  2) ufw  3) iptables  0) 跳过${NC}"
-    read -rp "选项： " fw_choice
-    [[ "$fw_choice" == "0" ]] && return
-
-    local selected_fw=""
-    case $fw_choice in
-        1) selected_fw="firewalld" ;; 2) selected_fw="ufw" ;; 3) selected_fw="iptables" ;; *) return ;;
-    esac
-    
-    for fw in firewalld ufw iptables; do 
-        [[ "$fw" != "$selected_fw" ]] && { systemctl stop "$fw" 2>/dev/null || true; systemctl disable "$fw" 2>/dev/null || true; }
+    for pkg in "${packages[@]}"; do
+        if [[ "$PKG_MGR" == "apt" ]]; then
+            if ! apt install -y "$pkg" &>> /tmp/install_$pkg.log; then
+                log WARN "安装失败: $pkg"
+                FAILED_PACKAGES+=("$pkg")
+            else
+                log SUCCESS "安装成功: $pkg"
+            fi
+        else
+            if ! $PKG_MGR install -y "$pkg" &>> /tmp/install_$pkg.log; then
+                log WARN "安装失败: $pkg"
+                FAILED_PACKAGES+=("$pkg")
+            else
+                log SUCCESS "安装成功: $pkg"
+            fi
+        fi
     done
-    
-    read -rp "开放端口 (默认含 SSH $RUN_SSH_PORT): " ports
-    ports=${ports:-$RUN_SSH_PORT}
-    [[ ! "$ports" =~ "$RUN_SSH_PORT" ]] && ports="$ports,$RUN_SSH_PORT"
 
-    if [[ "$selected_fw" == "firewalld" ]]; then
-        $PKG_MGR install -y firewalld 2>/dev/null || true
-        systemctl enable --now firewalld
-        for p in $(echo $ports | tr ',' ' '); do firewall-cmd --permanent --add-port=$p/tcp; done
-        firewall-cmd --reload
-    elif [[ "$selected_fw" == "ufw" ]]; then
-        $PKG_MGR install -y ufw 2>/dev/null || true
-        ufw --force reset; ufw default deny incoming
-        for p in $(echo $ports | tr ',' ' '); do ufw allow $p/tcp; done
-        ufw --force enable
-    elif [[ "$selected_fw" == "iptables" ]]; then
-        $PKG_MGR install -y iptables-services 2>/dev/null || true
-        systemctl enable --now iptables
-        iptables -F; iptables -P INPUT DROP
-        iptables -A INPUT -i lo -j ACCEPT
-        iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-        for p in $(echo $ports | tr ',' ' '); do iptables -A INPUT -p tcp --dport $p -j ACCEPT; done
-        service iptables save 2>/dev/null || true
+    if [[ ${#FAILED_PACKAGES[@]} -eq 0 ]]; then
+        CONFIG_STATUS[PACKAGES]="全部成功"
+    else
+        CONFIG_STATUS[PACKAGES]="部分失败 (${FAILED_PACKAGES[*]})"
+    fi
+}
+
+#-------------------------------------------------------------------------------
+# 2.5 安全加固 (SSH)
+#-------------------------------------------------------------------------------
+
+harden_ssh() {
+    log INFO "--- 🔒 SSH 安全加固 ---"
+    
+    if ! confirm_action "是否进行 SSH 安全加固？"; then
+        log INFO "跳过 SSH 加固。"
+        CONFIG_STATUS[SSH_HARDENING]="未启用"
+        return
+    fi
+
+    ADMIN_USER=$(get_input "请输入新管理员用户名" "admin")
+    
+    if id "$ADMIN_USER" &>/dev/null; then
+        log WARN "用户 $ADMIN_USER 已存在，跳过创建。"
+    else
+        useradd -m -s /bin/bash "$ADMIN_USER"
+        echo "请为用户 $ADMIN_USER 设置密码:"
+        passwd "$ADMIN_USER"
+        echo "$ADMIN_USER ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/$ADMIN_USER
+        chmod 440 /etc/sudoers.d/$ADMIN_USER
+        log SUCCESS "管理员 $ADMIN_USER 创建成功并配置 sudo。"
+    fi
+
+    local sshd_config="/etc/ssh/sshd_config"
+    backup_file "$sshd_config"
+    
+    NEW_SSH_PORT=$(get_input "请输入新的 SSH 端口" "22")
+    OPEN_PORTS+=("$NEW_SSH_PORT")
+    
+    sed -i "s/^#Port .*/#Port old_config/" "$sshd_config"
+    sed -i "s/^Port .*/#Port old_config/" "$sshd_config"
+    echo "Port $NEW_SSH_PORT" >> "$sshd_config"
+    
+    if confirm_action "是否禁止 Root 远程登录 (PermitRootLogin no)?"; then
+        sed -i "s/^#PermitRootLogin .*/PermitRootLogin no/" "$sshd_config"
+        sed -i "s/^PermitRootLogin .*/PermitRootLogin no/" "$sshd_config"
+        CONFIG_STATUS[ROOT_LOGIN]="禁止"
+    else
+        CONFIG_STATUS[ROOT_LOGIN]="允许"
     fi
     
-    systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null
-    log "SUCCESS" "防火墙配置完成。"
+    if confirm_action "是否禁止密码认证 (强制密钥登录)?"; then
+        sed -i "s/^#PasswordAuthentication .*/PasswordAuthentication no/" "$sshd_config"
+        sed -i "s/^PasswordAuthentication .*/PasswordAuthentication no/" "$sshd_config"
+        CONFIG_STATUS[PWD_AUTH]="禁止 (仅密钥)"
+    else
+        CONFIG_STATUS[PWD_AUTH]="允许"
+    fi
+    
+    sed -i "s/^#ClientAliveInterval .*/ClientAliveInterval 300/" "$sshd_config"
+    sed -i "s/^#ClientAliveCountMax .*/ClientAliveCountMax 3/" "$sshd_config"
+
+    log SUCCESS "SSH 配置文件已更新 (端口: $NEW_SSH_PORT)。服务将在防火墙配置后统一重启。"
+    CONFIG_STATUS[SSH_PORT]="$NEW_SSH_PORT"
+    CONFIG_STATUS[SSH_HARDENING]="已启用"
 }
 
-# ------------------------------------------------------------------------------
-# 模块 6, 7, 8: 时间、优化、磁盘
-# ------------------------------------------------------------------------------
-config_time() {
-    log "STEP" "[6/8] 时间同步..."
-    if ! ask_confirm "启用 Chrony？"; then return; fi
-    $PKG_MGR install -y chrony 2>/dev/null || true
-    systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony
+#-------------------------------------------------------------------------------
+# 2.6 防火墙配置
+#-------------------------------------------------------------------------------
+
+config_firewall() {
+    log INFO "--- 🛡️ 防火墙配置 ---"
+    
+    local fw_choice
+    PS3="请选择防火墙类型 [1-4]: "
+    select fw_choice in "firewalld (CentOS/Rocky)" "ufw (Ubuntu/Debian)" "iptables (原生)" "跳过"; do
+        case $fw_choice in
+            "firewalld (CentOS/Rocky)")
+                if ! command -v firewall-cmd &> /dev/null; then
+                    if [[ "$PKG_MGR" =~ yum|dnf ]]; then
+                        $PKG_MGR install -y firewalld
+                    else
+                        log ERROR "当前系统不支持或未安装 firewalld。"
+                        break
+                    fi
+                fi
+                systemctl stop ufw &>/dev/null; systemctl disable ufw &>/dev/null
+                systemctl enable firewalld --now
+                
+                firewall-cmd --permanent --add-port=${NEW_SSH_PORT}/tcp
+                firewall-cmd --permanent --remove-service=ssh 2>/dev/null
+                
+                local extra_ports=$(get_input "请输入额外开放的业务端口 (空格分隔，如 80 443)" "")
+                if [[ -n "$extra_ports" ]]; then
+                    for port in $extra_ports; do
+                        firewall-cmd --permanent --add-port=${port}/tcp
+                        OPEN_PORTS+=("$port")
+                    done
+                fi
+                
+                firewall-cmd --reload
+                log SUCCESS "Firewalld 配置完成。"
+                CONFIG_STATUS[FIREWALL]="Firewalld"
+                break
+                ;;
+            "ufw (Ubuntu/Debian)")
+                if ! command -v ufw &> /dev/null; then
+                    apt install -y ufw
+                fi
+                systemctl stop firewalld &>/dev/null; systemctl disable firewalld &>/dev/null
+                
+                ufw --force reset
+                ufw default deny incoming
+                ufw default allow outgoing
+                
+                ufw allow ${NEW_SSH_PORT}/tcp
+                local extra_ports=$(get_input "请输入额外开放的业务端口 (空格分隔)" "")
+                if [[ -n "$extra_ports" ]]; then
+                    for port in $extra_ports; do
+                        ufw allow ${port}/tcp
+                        OPEN_PORTS+=("$port")
+                    done
+                fi
+                
+                echo "y" | ufw enable
+                log SUCCESS "UFW 配置完成。"
+                CONFIG_STATUS[FIREWALL]="UFW"
+                break
+                ;;
+            "iptables (原生)")
+                log WARN "Iptables 配置较复杂，仅做基础放行示例。"
+                iptables -I INPUT 1 -p tcp --dport ${NEW_SSH_PORT} -j ACCEPT
+                if command -v iptables-save &> /dev/null; then
+                    iptables-save > /etc/sysconfig/iptables 2>/dev/null || iptables-save > /etc/iptables/rules.v4 2>/dev/null
+                fi
+                CONFIG_STATUS[FIREWALL]="Iptables (基础)"
+                break
+                ;;
+            "跳过")
+                log INFO "跳过防火墙配置。"
+                CONFIG_STATUS[FIREWALL]="未启用"
+                return
+                ;;
+            *) log WARN "无效选项，请输入数字 1-4";;
+        esac
+    done
+
+    log INFO "正在重启 SSH 服务以应用新端口..."
+    if systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; then
+        log SUCCESS "SSH 服务重启成功。"
+    else
+        log ERROR "❌ SSH 服务重启失败！请立即检查。"
+    fi
 }
+
+#-------------------------------------------------------------------------------
+# 2.7 系统优化与维护 (模块化)
+#-------------------------------------------------------------------------------
 
 optimize_system() {
-    log "STEP" "[7/8] 系统优化..."
-    if ! ask_confirm "应用内核优化？"; then return; fi
-    local sysctl_file="/etc/sysctl.conf"
-    create_backup "$sysctl_file"
-    grep -q "vm.swappiness" "$sysctl_file" || echo "vm.swappiness = $DEF_SWAPPINESS" >> "$sysctl_file"
-    grep -q "fs.file-max" "$sysctl_file" || echo "fs.file-max = 1000000" >> "$sysctl_file"
-    sysctl -p > /dev/null
-    local limits_file="/etc/security/limits.conf"
-    grep -q "nofile $DEF_FILE_LIMIT" "$limits_file" || cat << EOF >> "$limits_file"
-* soft nofile $DEF_FILE_LIMIT
-* hard nofile $DEF_FILE_LIMIT
-EOF
-}
-
-init_disk() {
-    log "STEP" "[8/8] 扫描数据盘..."
-    local available_disks=()
-    while IFS= read -r line; do
-        local disk_name=$(echo "$line" | awk '{print $1}')
-        local disk_size=$(echo "$line" | awk '{print $2}')
-        local disk_type=$(echo "$line" | awk '{print $3}')
-        local mount_point=$(echo "$line" | awk '{print $4}')
-        if [[ "$disk_type" == "disk" && -z "$mount_point" ]]; then
-            local is_mounted=false
-            for part in /dev/${disk_name}*; do
-                [[ -b "$part" ]] && mount | grep -q "^$part " && { is_mounted=true; break; }
-            done
-            [[ "$is_mounted" == false ]] && available_disks+=("$disk_name ($disk_size)")
-        fi
-    done < <(lsblk -ndo NAME,SIZE,TYPE,MOUNTPOINT --paths 2>/dev/null | grep -v "loop\|rom")
-
-    if [[ ${#available_disks[@]} -eq 0 ]]; then
-        log "SUCCESS" "无可用数据盘。"
-        return 0
-    fi
-
-    log "SUCCESS" "发现数据盘："
-    for i in "${!available_disks[@]}"; do echo "   $((i+1)). ${available_disks[$i]}"; done
-
-    if ! ask_confirm "是否初始化？"; then return 0; fi
-
-    while true; do
-        printf "选择编号 (1-${#available_disks[@]}): "
-        read -r choice
-        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#available_disks[@]} )); then
-            local selected_disk=$(echo "${available_disks[$((choice-1))]}" | awk '{print $1}' | xargs basename)
-            break
-        fi
-    done
-
-    get_input "设置挂载点" "$DEF_DATA_MOUNT"
-    local mnt="$INPUT_RESULT"
+    log INFO "--- ⚡ 系统优化 ---"
     
-    if ask_confirm "⚠️ 确认格式化 /dev/$selected_disk？"; then
-        mkfs.ext4 -F "/dev/$selected_disk"
-        mkdir -p "$mnt"
-        local uuid=$(blkid -s UUID -o value "/dev/$selected_disk")
-        create_backup "/etc/fstab"
-        grep -q "$uuid" /etc/fstab || echo "UUID=$uuid $mnt ext4 defaults 0 0" >> /etc/fstab
-        mount -a
-        if mount | grep -q "$mnt"; then
-            RUN_DATA_MOUNT_INFO="$mnt (/dev/$selected_disk)"
-            log "SUCCESS" "挂载成功。"
+    # 1. 时间同步 (增加自定义服务器选项)
+    if confirm_action "是否安装并启用 Chrony 时间同步服务？"; then
+        if command -v chronyd &> /dev/null || command -v chrony &> /dev/null; then
+            # 【新增功能】询问是否自定义 NTP 服务器
+            if confirm_action "是否手动指定 NTP 同步服务器？(选 n 使用默认阿里云)"; then
+                local custom_ntp=$(get_input "请输入 NTP 服务器地址 (空格分隔多个)" "")
+                if [[ -n "$custom_ntp" ]]; then
+                    NTP_SERVERS="$custom_ntp"
+                    log INFO "将使用自定义 NTP 服务器: $NTP_SERVERS"
+                else
+                    log WARN "未输入有效地址，自动切换回默认阿里云服务器。"
+                    NTP_SERVERS="$DEFAULT_NTP_SERVERS"
+                fi
+            else
+                NTP_SERVERS="$DEFAULT_NTP_SERVERS"
+                log INFO "将使用默认阿里云 NTP 服务器: $NTP_SERVERS"
+            fi
+
+            # 确定配置文件路径 (不同发行版路径可能不同)
+            local chrony_conf="/etc/chrony.conf"
+            if [[ ! -f "$chrony_conf" ]] && [[ -f "/etc/chrony/chrony.conf" ]]; then
+                chrony_conf="/etc/chrony/chrony.conf"
+            fi
+
+            backup_file "$chrony_conf"
+            
+            # 备份原文件后，清空原有的 server 行并写入新的
+            # 注意：这里采用追加方式，但为了干净，先注释掉原有的 server/pool 行
+            sed -i 's/^server /#server /g' "$chrony_conf"
+            sed -i 's/^pool /#pool /g' "$chrony_conf"
+            
+            # 写入新的服务器列表
+            echo "" >> "$chrony_conf"
+            echo "# Configured by init_server.sh" >> "$chrony_conf"
+            for srv in $NTP_SERVERS; do
+                echo "server $srv iburst" >> "$chrony_conf"
+            done
+            
+            # 重启服务
+            systemctl enable chronyd --now 2>/dev/null || systemctl enable chrony --now 2>/dev/null
+            # 强制刷新一次时间
+            chronyc -a makestep &>/dev/null
+            
+            log SUCCESS "Chrony 时间同步已启用 (服务器: $NTP_SERVERS)。"
+            CONFIG_STATUS[CHRONY]="已启用 ($NTP_SERVERS)"
+        else
+            log WARN "未找到 chrony 包，跳过。"
+            CONFIG_STATUS[CHRONY]="未安装"
+        fi
+    else
+        log INFO "跳过时间同步配置。"
+        CONFIG_STATUS[CHRONY]="未配置"
+    fi
+    
+    # 2. 内核参数调优
+    if confirm_action "是否进行内核参数调优 (vm.swappiness, file-max 等)?"; then
+        backup_file /etc/sysctl.conf
+        cat >> /etc/sysctl.conf <<EOF
+# Optimized by init_server.sh
+vm.swappiness = 10
+fs.file-max = 2097152
+net.core.somaxconn = 65535
+EOF
+        sysctl -p &>/dev/null
+        log SUCCESS "内核参数已调优。"
+        CONFIG_STATUS[KERNEL_TUNING]="已完成"
+    else
+        log INFO "跳过内核参数调优。"
+        CONFIG_STATUS[KERNEL_TUNING]="未配置"
+    fi
+
+    # 3. 文件句柄数限制
+    if confirm_action "是否修改文件句柄数限制 (nofile 65535)?"; then
+        backup_file /etc/security/limits.conf
+        if ! grep -q "nofile 65535" /etc/security/limits.conf; then
+            cat >> /etc/security/limits.conf <<EOF
+* soft nofile 65535
+* hard nofile 65535
+root soft nofile 65535
+root hard nofile 65535
+EOF
+            log SUCCESS "文件句柄数限制已更新。"
+        fi
+    fi
+    
+    # 4. 数据盘自动化挂载
+    log INFO "扫描未挂载磁盘..."
+    local disks=($(lsblk -dpno NAME,TYPE,MOUNTPOINT | awk '$2=="disk" && $3=="" {print $1}'))
+    
+    if [[ ${#disks[@]} -eq 0 ]]; then
+        log INFO "未发现未挂载的数据盘，跳过。"
+        DATA_DISK_MOUNTED="无"
+    else
+        log INFO "发现以下未挂载磁盘: ${disks[*]}"
+        if confirm_action "是否格式化并挂载数据盘？"; then
+            PS3="请选择要格式化的磁盘 [1-${#disks[@]}]: "
+            select disk in "${disks[@]}" "取消"; do
+                if [[ "$disk" == "取消" ]]; then
+                    DATA_DISK_MOUNTED="用户取消"
+                    break
+                elif [[ -n "$disk" ]]; then
+                    local mount_point=$(get_input "请输入挂载点" "/data")
+                    
+                    log WARN "⚠️ 即将格式化 $disk (数据将永久丢失)! 确认继续？(输入 yes 确认)"
+                    read -rp "确认: " confirm_fmt
+                    if [[ "$confirm_fmt" == "yes" ]]; then
+                        mkfs.ext4 -F "$disk"
+                        mkdir -p "$mount_point"
+                        local uuid=$(blkid -s UUID -o value "$disk")
+                        echo "UUID=$uuid $mount_point ext4 defaults 0 0" >> /etc/fstab
+                        mount -a
+                        chown -R $ADMIN_USER:$ADMIN_USER "$mount_point" 2>/dev/null || chown -R root:root "$mount_point"
+                        log SUCCESS "磁盘 $disk 已格式化并挂载到 $mount_point"
+                        DATA_DISK_MOUNTED="$disk -> $mount_point"
+                    else
+                        log INFO "取消格式化。"
+                        DATA_DISK_MOUNTED="未操作"
+                    fi
+                    break
+                else
+                    log WARN "无效选项，请输入数字。"
+                fi
+            done
+        else
+            DATA_DISK_MOUNTED="用户跳过"
         fi
     fi
 }
 
-# =============================================================================
-# 【🏁 主程序 & 总结报告】
-# =============================================================================
+#-------------------------------------------------------------------------------
+# 2.8 交付与收尾
+#-------------------------------------------------------------------------------
+
+generate_report() {
+    clear
+    echo -e "${COLOR_GREEN}${COLOR_BOLD}========================================${COLOR_RESET}"
+    echo -e "${COLOR_GREEN}${COLOR_BOLD}       🎉 服务器初始化完成报告           ${COLOR_RESET}"
+    echo -e "${COLOR_GREEN}${COLOR_BOLD}========================================${COLOR_RESET}"
+    echo ""
+    
+    local report_content=""
+    report_content+="时间：$(date)\n"
+    report_content+="主机名：${CONFIG_STATUS[HOSTNAME]}\n"
+    report_content+="IP 模式：${CONFIG_STATUS[IP_MODE]}\n"
+    if [[ "$STATIC_IP_MODE" == "yes" ]]; then
+        local cur_ip=$(ip -4 addr show $CURRENT_IFACE 2>/dev/null | grep inet | awk '{print $2}' | cut -d/ -f1 | head -n1)
+        report_content+="IP 地址：${cur_ip}\n"
+        report_content+="网关：${CONFIG_STATUS[GATEWAY]}\n"
+    fi
+    report_content+="基础组件：${CONFIG_STATUS[PACKAGES]}\n"
+    if [[ -n "$ADMIN_USER" ]]; then
+        report_content+="管理员用户：$ADMIN_USER\n"
+    fi
+    report_content+="SSH 端口：${CONFIG_STATUS[SSH_PORT]:-22}\n"
+    report_content+="SSH 加固：${CONFIG_STATUS[SSH_HARDENING]:-未启用}\n"
+    report_content+="Root 登录：${CONFIG_STATUS[ROOT_LOGIN]:-未配置}\n"
+    report_content+="密码认证：${CONFIG_STATUS[PWD_AUTH]:-未配置}\n"
+    report_content+="防火墙：${CONFIG_STATUS[FIREWALL]:-未启用}\n"
+    
+    if [[ ${#OPEN_PORTS[@]} -gt 0 ]]; then
+        local unique_ports=($(echo "${OPEN_PORTS[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' '))
+        report_content+="开放端口：${unique_ports[*]}\n"
+    else
+        report_content+="开放端口：无额外配置\n"
+    fi
+
+    report_content+="时间同步：${CONFIG_STATUS[CHRONY]:-未配置}\n"
+    report_content+="内核调优：${CONFIG_STATUS[KERNEL_TUNING]:-未配置}\n"
+    report_content+="数据盘：${DATA_DISK_MOUNTED}\n"
+    
+    if [[ ${#FAILED_PACKAGES[@]} -gt 0 ]]; then
+        report_content+="\n${COLOR_RED}⚠️ 警告：以下软件包安装失败：${FAILED_PACKAGES[*]}${COLOR_RESET}\n"
+    fi
+    
+    echo -e "$report_content"
+    echo -e "$report_content" > "$REPORT_FILE"
+    echo ""
+    echo -e "${COLOR_CYAN}📄 详细报告已保存至：$REPORT_FILE${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}📜 操作日志已保存至：$LOG_FILE${COLOR_RESET}"
+    echo -e "${COLOR_CYAN}💾 备份目录位于：$BACKUP_DIR${COLOR_RESET}"
+    echo ""
+}
+
+final_reboot() {
+    if confirm_action "是否立即重启服务器以使所有配置生效？"; then
+        log INFO "系统将在 3 秒后重启..."
+        sleep 1
+        echo "3..."
+        sleep 1
+        echo "2..."
+        sleep 1
+        echo "1..."
+        reboot
+    else
+        log INFO "配置完成。请手动执行 'reboot' 重启服务器。"
+        if [[ "${CONFIG_STATUS[SSH_PORT]}" != "22" ]]; then
+            echo "⚠️ 提示：您修改了 SSH 端口，重启后请使用以下命令连接："
+            echo "   ssh -p ${CONFIG_STATUS[SSH_PORT]} ${ADMIN_USER}@<服务器IP>"
+        fi
+    fi
+}
+
+#-------------------------------------------------------------------------------
+# 主执行流程
+#-------------------------------------------------------------------------------
+
 main() {
     check_root
     detect_os
-    mkdir -p "$BACKUP_DIR"
+    init_logging
     
-    echo -e "${BOLD}${CYAN}==========================================\n   服务器初始化脚本 (v21.0 Enhanced)\n==========================================${NC}"
-    log "SUCCESS" "脚本启动。"
-
-    config_network_identity
-    config_local_repo
-    check_and_install_components
-    harden_security
+    log INFO "🚀 开始初始化流程..."
+    
+    config_hostname
+    config_network
+    config_repos
+    install_packages
+    harden_ssh
     config_firewall
-    config_time
     optimize_system
-    init_disk
     
-    # ★★★ 配置总结报告 ★★★
-    echo -e "\n${BOLD}${GREEN}=========================================="
-    echo "   📋 配置变更总结报告"
-    echo "==========================================${NC}"
-    echo -e "${BOLD}🖥️  主机名:${NC}      $RUN_HOSTNAME"
-    echo -e "${BOLD}🌐  IP 模式:${NC}     $RUN_IP_MODE"
-    echo -e "${BOLD}🌐  IP 地址:${NC}     $RUN_IP_ADDR"
-    echo -e "${BOLD}🚪  网关:${NC}        $RUN_GATEWAY"
-    echo -e "${BOLD}📦  组件安装:${NC}    $RUN_COMPONENTS_INSTALLED"
-    echo -e "${BOLD}👤  管理员:${NC}      $RUN_ADMIN_USER"
-    echo -e "${BOLD}🔑  SSH 端口:${NC}    $RUN_SSH_PORT"
-    echo -e "${BOLD}🚫  禁 Root:${NC}     $RUN_DISABLE_ROOT"
-    echo -e "${BOLD}🚫  禁密码:${NC}      $RUN_DISABLE_PASS"
-    echo -e "${BOLD}💾  数据盘:${NC}      $RUN_DATA_MOUNT_INFO"
-    echo -e "${GREEN}==========================================${NC}\n"
-
-    if ask_confirm "是否立即重启？"; then
-        log "INFO" "3 秒后重启..."
-        sleep 3
-        reboot
-    else
-        log "INFO" "未重启。建议手动 reboot。"
-    fi
+    generate_report
+    final_reboot
 }
 
 main "$@"
