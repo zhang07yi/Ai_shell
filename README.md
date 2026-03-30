@@ -35,12 +35,9 @@ PID 文件记录方式，采用基于 /proc 文件系统、lsof 端口检测和 
    0 2 * * * /path/to/universal_cleaner.sh >> /var/log/universal_cleaner_logs/cron.log 2>&1
 
 
-# upgrade_dm_driver.sh 和 rollback_dm_driver.sh （感谢Qwen3.5 plus）
-功能描述: 批量替换达梦数据库驱动(Driver)与方言(Dialect)文件，并自动备份旧版本。
-请在执行前确认 NEW_DRIVER 和 NEW_DIALECT 路径正确。
-
-脚本名称: rollback_dm_driver.sh
-功能描述: 紧急回滚达梦数据库驱动与方言文件到最近的备份版本。
+# driver_manger.sh （感谢Qwen3.5 plus）
+ 功能描述: 中间件驱动组件自动化升级与回滚工具
+ 适用范围: 适用于多节点、多路径的驱动文件替换场景
 
 
 
